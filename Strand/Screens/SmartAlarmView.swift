@@ -5,10 +5,11 @@ import StrandDesign
 ///
 /// HONEST by design: a sideloaded, backgrounded app on iOS can't fire a dependable LOUD wake alarm
 /// (that needs the critical-alert entitlement, which a non-App-Store build doesn't have), so this
-/// platform deliberately does NOT offer a wake alarm. The dependable phone wake lives on Android,
-/// which has the exact-alarm primitive. Here we offer the cross-platform WIND-DOWN nudge — a gentle
-/// evening reminder — and we say plainly why there's no wake alarm, rather than promising one we
-/// can't keep.
+/// platform doesn't promise one. What it DOES offer: the strap's own firmware alarm (a silent wrist
+/// buzz, armed over BLE below in `strapAlarmCard`), an optional adaptive early wake within a window
+/// you choose (`adaptiveWakeSection` — the light-sleep watcher Android's phone alarm also has, ported
+/// here), and the cross-platform WIND-DOWN nudge below that. Each card says plainly what it can and
+/// can't guarantee, rather than promising a loud wake this build can't keep.
 struct SmartAlarmView: View {
     // #766: this is now the ONE alarm surface. The strap's silent firmware wake-alarm used to live in a
     // separate card over in Automations, which let users conflate it with the wind-down reminder; it's
@@ -99,7 +100,7 @@ struct SmartAlarmView: View {
                     Text("The strap alarm is a silent buzz, not a sound")
                         .font(StrandFont.headline)
                         .foregroundStyle(StrandPalette.textPrimary)
-                    Text("The wake-alarm above buzzes your wrist from the strap's own firmware. It can't sound a loud alarm. We also schedule a backup notification at your wake time, but a sideloaded app can't sound a guaranteed wake on this device (that needs a critical-alert permission this build doesn't have), so Focus or silent mode can still mute it. Keep your phone's built-in Clock alarm as your real backup. NOOP's phone-based smart wake (light-sleep detection) is available on the Android app.")
+                    Text("The wake-alarm above buzzes your wrist from the strap's own firmware. It can't sound a loud alarm. We also schedule a backup notification at your wake time, but a sideloaded app can't sound a guaranteed wake on this device (that needs a critical-alert permission this build doesn't have), so Focus or silent mode can still mute it. Keep your phone's built-in Clock alarm as your real backup. Turn on \"Wake on a lighter sleep phase\" below to try an earlier buzz inside a window you choose — it needs your phone to keep hearing the strap's heart rate overnight, which is best-effort even with Bluetooth background delivery on, so the guaranteed buzz at the end of the window is still the one to count on.")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -148,15 +149,18 @@ struct SmartAlarmView: View {
                 if behavior.smartAlarmEnabled {
                     Divider().overlay(StrandPalette.hairline)
                     HStack {
-                        Text("Wake at").font(StrandFont.body).foregroundStyle(StrandPalette.textPrimary)
+                        Text(behavior.smartAlarmAdaptiveEnabled ? "Earliest wake" : "Wake at")
+                            .font(StrandFont.body).foregroundStyle(StrandPalette.textPrimary)
                         Spacer()
                         DatePicker("", selection: alarmTimeBinding, displayedComponents: .hourAndMinute)
                             .labelsHidden().datePickerStyle(.compact)
-                            .accessibilityLabel("Wake time")
+                            .accessibilityLabel(behavior.smartAlarmAdaptiveEnabled ? "Earliest wake time" : "Wake time")
                     }
                     .frame(minHeight: 42)
                     Divider().overlay(StrandPalette.hairline)
                     alarmWeekdayPicker
+                    Divider().overlay(StrandPalette.hairline)
+                    adaptiveWakeSection
                     // #864: a WHOOP 5/MG only arms its firmware alarm when Experimental is on (see
                     // BLEManager.armStrapAlarm, which logs "not armed" and returns otherwise). Without this
                     // branch the card claimed "Armed on the strap itself" to a 5/MG owner whose strap was
@@ -189,6 +193,50 @@ struct SmartAlarmView: View {
             .onChangeCompat(of: behavior.smartAlarmEnabled) { _ in model.applySmartAlarm() }
             .onChangeCompat(of: behavior.smartAlarmMinutes) { _ in model.applySmartAlarm() }
             .onChangeCompat(of: behavior.smartAlarmWeekdays) { _ in model.applySmartAlarm() }
+            .onChangeCompat(of: behavior.smartAlarmAdaptiveEnabled) { _ in model.applySmartAlarm() }
+            .onChangeCompat(of: behavior.smartAlarmWindowMinutes) { _ in model.applySmartAlarm() }
+        }
+    }
+
+    // MARK: - Adaptive wake (#207) — light-sleep early wake, ported from the Android phone smart alarm
+
+    /// Toggle + (when on) window stepper for the adaptive wake. Reuses "Earliest wake"/DatePicker
+    /// above unchanged; this only adds the window on top of it. Off by default (opt-in), and behaves
+    /// exactly as the old fixed-time strap buzz when off.
+    @ViewBuilder private var adaptiveWakeSection: some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Wake on a lighter sleep phase")
+                    .font(StrandFont.body)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                Text("NOOP watches your live heart rate for a sign you're stirring inside the window below, and buzzes the strap then instead of waiting for the guaranteed time. A coarse heuristic, not a sleep-stage classifier — if it never sees a lighter phase (or your phone loses the strap overnight), you still get the guaranteed buzz at the end of the window.")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Toggle("", isOn: $behavior.smartAlarmAdaptiveEnabled)
+                .labelsHidden().toggleStyle(.switch).tint(StrandPalette.accent)
+                .accessibilityLabel("Wake on a lighter sleep phase")
+        }
+        .frame(minHeight: 42)
+
+        if behavior.smartAlarmAdaptiveEnabled {
+            Divider().overlay(StrandPalette.hairline)
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Window").font(StrandFont.body).foregroundStyle(StrandPalette.textPrimary)
+                    Text("Guaranteed buzz by \(timeLabel((behavior.smartAlarmMinutes + behavior.smartAlarmWindowMinutes) % (24 * 60))).")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                }
+                Spacer()
+                Stepper("\(behavior.smartAlarmWindowMinutes) min", value: $behavior.smartAlarmWindowMinutes, in: 5...60, step: 5)
+                    .fixedSize()
+                    .accessibilityLabel("Wake window length")
+                    .accessibilityValue("\(behavior.smartAlarmWindowMinutes) minutes")
+            }
+            .frame(minHeight: 42)
         }
     }
 

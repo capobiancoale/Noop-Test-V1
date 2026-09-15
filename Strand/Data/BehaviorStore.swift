@@ -43,6 +43,15 @@ final class BehaviorStore: ObservableObject {
     /// Weekdays the alarm fires on (Calendar weekday numbers: 1 = Sun … 7 = Sat). An empty set means
     /// "every day" — the backward-compatible default for anyone upgrading from before per-day scheduling.
     @Published var smartAlarmWeekdays: Set<Int> { didSet { d.set(Array(smartAlarmWeekdays).sorted(), forKey: K.alarmWeekdays) } }
+    /// Adaptive wake (#207): when on, `smartAlarmMinutes` becomes the EARLIEST acceptable wake time and
+    /// NOOP tries to wake you on a lighter sleep phase within `smartAlarmWindowMinutes` after it, with a
+    /// guaranteed strap buzz + backup notification at the end of the window if no lighter phase is
+    /// detected. Default OFF (opt-in): with it off, `smartAlarmMinutes` behaves exactly as before — an
+    /// exact wake time, unchanged.
+    @Published var smartAlarmAdaptiveEnabled: Bool { didSet { d.set(smartAlarmAdaptiveEnabled, forKey: K.alarmAdaptive) } }
+    /// Minutes after `smartAlarmMinutes` the guaranteed deadline sits when adaptive is on. Only read
+    /// when `smartAlarmAdaptiveEnabled` is true; the UI keeps this in 5...60 via its Stepper bounds.
+    @Published var smartAlarmWindowMinutes: Int { didSet { d.set(smartAlarmWindowMinutes, forKey: K.alarmWindow) } }
 
     // MARK: Illness early-warning
     @Published var illnessWatch: Bool { didSet { d.set(illnessWatch, forKey: K.illness) } }
@@ -68,9 +77,11 @@ final class BehaviorStore: ObservableObject {
         static let alarmOn = "behavior.smartAlarmEnabled"
         static let alarmTime = "behavior.smartAlarmMinutes"
         static let alarmWeekdays = "behavior.smartAlarmWeekdays"
-        // "behavior.smartAlarmWindow" retired: it was stored but never read (no wake-window
-        // watcher ever shipped). The defaults key is left orphaned on purpose — harmless, and
-        // preserved should a real light-sleep watcher ever land.
+        static let alarmAdaptive = "behavior.smartAlarmAdaptive"
+        // Un-orphaned: this key used to be written but never read (no wake-window watcher had
+        // shipped yet). SleepWindowWatcher + AppModel.evaluateSmartAlarmWindow now read it, so any
+        // value a user set before this landed is picked back up rather than lost.
+        static let alarmWindow = "behavior.smartAlarmWindow"
         static let illness = "behavior.illnessWatch"
         static let batteryAlerts = "behavior.batteryAlerts"
     }
@@ -92,6 +103,8 @@ final class BehaviorStore: ObservableObject {
         // Stored as a plain [Int]; only valid weekday numbers (1…7) are kept so a corrupted defaults
         // entry can never schedule against a bogus day. Empty (or all 7) = every day.
         smartAlarmWeekdays = Set((d.array(forKey: K.alarmWeekdays) as? [Int] ?? []).filter { (1...7).contains($0) })
+        smartAlarmAdaptiveEnabled = d.object(forKey: K.alarmAdaptive) as? Bool ?? false
+        smartAlarmWindowMinutes = min(60, max(5, d.object(forKey: K.alarmWindow) as? Int ?? 30))
         illnessWatch = d.object(forKey: K.illness) as? Bool ?? false
         batteryAlerts = d.object(forKey: K.batteryAlerts) as? Bool ?? true
     }

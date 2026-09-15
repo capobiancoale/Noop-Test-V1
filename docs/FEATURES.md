@@ -459,7 +459,17 @@ React when the strap comes off or goes on:
 ### Smart alarm
 Wake to a wrist buzz. This arms the strap's **own firmware alarm**, so it still fires even if the
 Mac is asleep or NOOP is closed. Set your wake time — the strap buzzes at exactly that time.
-NOOP does not currently do light-sleep early wake.
+
+**Adaptive wake (opt-in).** Turn on "Wake on a lighter sleep phase" and the time you set becomes
+the *earliest* acceptable wake instead of an exact one: NOOP watches your live heart rate for a
+sign you're stirring inside a window you choose (5–60 minutes) and buzzes the strap then, with a
+guaranteed buzz + backup notification at the end of the window if it never sees a lighter phase.
+The detector is a coarse heart-rate-trough heuristic, not a sleep-stage classifier, and it depends
+on your phone keeping a live BLE connection to the strap overnight — best-effort even with
+Bluetooth background delivery on, so the guaranteed buzz at the window's end is what to count on.
+This mirrors the Android app's phone-based smart alarm; the two aren't identical under the hood
+(Android schedules a hard OS alarm it can only move earlier, iOS/macOS re-arms the same strap
+alarm + notification), but the wake-window idea and the honesty about it being advisory-only match.
 
 Mac side-effects are sandbox-friendly: screen lock uses macOS's own lock entry point, and
 Shortcuts run via the `shortcuts://` URL scheme — anything you can build in Shortcuts is reachable.

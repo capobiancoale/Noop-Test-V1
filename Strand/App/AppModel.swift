@@ -197,6 +197,16 @@ final class AppModel: ObservableObject {
     private var readSpineCancellable: AnyCancellable?
     /// Daily re-arm timer for the single-instant firmware smart alarm (see scheduleDailySmartAlarmRearm).
     private var smartAlarmRearmTimer: Timer?
+    /// Pure light-sleep detector for the adaptive smart alarm (#207, iOS/macOS). Reset every time
+    /// `applySmartAlarm` re-arms tonight's window; fed live HR by `evaluateSmartAlarmWindow`.
+    private let smartAlarmWatcher = SleepWindowWatcher()
+    /// Tonight's adaptive wake window, set by `applySmartAlarm` when `smartAlarmAdaptiveEnabled` is
+    /// on; nil when adaptive is off (or nothing is armed yet), so `evaluateSmartAlarmWindow` no-ops.
+    private var smartAlarmWindowStart: Date?
+    private var smartAlarmWindowDeadline: Date?
+    /// True once this window's alarm has been advanced early, so a second lighter-phase reading
+    /// doesn't re-advance (or double-post) the same wake.
+    private var smartAlarmAdvancedTonight = false
 
     init() {
         let live = LiveState()
@@ -235,6 +245,7 @@ final class AppModel: ObservableObject {
         }.store(in: &hrCancellables)
         // Smooth HR centrally so it's solid everywhere it's shown.
         live.$heartRate.sink { [weak self] _ in self?.ingestHR() }.store(in: &hrCancellables)
+        live.$heartRate.sink { [weak self] hr in self?.evaluateSmartAlarmWindow(hr) }.store(in: &hrCancellables)
         live.$rr.sink { [weak self] _ in self?.ingestHR() }.store(in: &hrCancellables)
 
         // Physical-input + wear hooks (fired live by FrameRouter).
@@ -1121,29 +1132,73 @@ final class AppModel: ObservableObject {
     /// On iOS this ALSO (dis)arms the best-effort backup wake notification (#4 + #6): a repeating daily
     /// `UNCalendarNotificationTrigger` that survives suspend/relaunch, so a missed strap buzz still gets
     /// an OS-level wake. macOS keeps just the firmware alarm (the static helpers are no-ops there).
+    ///
+    /// Adaptive (#207): when `smartAlarmAdaptiveEnabled` is on, `smartAlarmMinutes` is read as the
+    /// EARLIEST acceptable wake instead of an exact time. The strap + backup notification are armed
+    /// at the LATEST edge of the window (`smartAlarmMinutes + smartAlarmWindowMinutes`) as the
+    /// guaranteed fallback, and `smartAlarmWatcher` is reset to watch the window opening — mirroring
+    /// the Android phone smart alarm's fallback-first design (the deadline is armed FIRST and can
+    /// only ever be moved earlier, never later or skipped, by `evaluateSmartAlarmWindow`). With
+    /// adaptive off (the default) this behaves exactly as before: an exact wake time, no window.
     func applySmartAlarm() {
         guard behavior.smartAlarmEnabled else {
             ble.disableStrapAlarm()
             Self.cancelSmartAlarmBackupNotification()
+            smartAlarmWindowStart = nil
+            smartAlarmWindowDeadline = nil
             return
         }
-        guard let next = Self.nextSmartAlarmDate(minutes: behavior.smartAlarmMinutes,
-                                                 weekdays: behavior.smartAlarmWeekdays) else {
+        let adaptive = behavior.smartAlarmAdaptiveEnabled
+        let windowMinutes = adaptive ? min(60, max(5, behavior.smartAlarmWindowMinutes)) : 0
+        let deadlineMinutes = (behavior.smartAlarmMinutes + windowMinutes) % (24 * 60)
+        guard let deadline = Self.nextSmartAlarmDate(minutes: deadlineMinutes,
+                                                     weekdays: behavior.smartAlarmWeekdays) else {
             // No enabled weekday in the next week (only possible from a corrupted set) , disarm rather
             // than arm a misleading time the user never asked for.
             ble.disableStrapAlarm()
             Self.cancelSmartAlarmBackupNotification()
+            smartAlarmWindowStart = nil
+            smartAlarmWindowDeadline = nil
             return
         }
-        ble.armStrapAlarm(at: next)
+        ble.armStrapAlarm(at: deadline)
         // Replace (remove + re-add by stable identifier) on every re-arm so the backup never stacks.
         // The log sink hops to the main actor because the auth check completes off-main and LiveState is
         // @MainActor - the same Task hop the importTraceSink uses.
-        Self.scheduleSmartAlarmBackupNotification(minutes: behavior.smartAlarmMinutes,
+        Self.scheduleSmartAlarmBackupNotification(minutes: deadlineMinutes,
                                                   weekdays: behavior.smartAlarmWeekdays,
                                                   log: { [weak self] line in
                                                       Task { @MainActor in self?.live.append(log: line) }
                                                   })
+        if adaptive {
+            smartAlarmWatcher.reset()
+            smartAlarmWindowDeadline = deadline
+            smartAlarmWindowStart = deadline.addingTimeInterval(-Double(windowMinutes * 60))
+            smartAlarmAdvancedTonight = false
+        } else {
+            smartAlarmWindowStart = nil
+            smartAlarmWindowDeadline = nil
+        }
+    }
+
+    /// Feed the live heart rate to the adaptive smart-alarm watcher (#207) while `now` is inside
+    /// tonight's wake window, advancing the wake the moment the pattern looks like a lighter sleep
+    /// phase. A no-op whenever adaptive is off, no window is armed, `now` is outside it, or it
+    /// already advanced tonight. Can only move the wake EARLIER: it re-arms the SAME strap alarm +
+    /// backup notification for `now`, exactly like `applySmartAlarm` would for any other time — the
+    /// guaranteed deadline that call already armed is what fires if this never runs (BLE drops, the
+    /// app gets no background HR delivery, or the pattern never looks like a lighter phase).
+    private func evaluateSmartAlarmWindow(_ hr: Int?) {
+        guard behavior.smartAlarmEnabled, behavior.smartAlarmAdaptiveEnabled, !smartAlarmAdvancedTonight,
+              let start = smartAlarmWindowStart, let deadline = smartAlarmWindowDeadline else { return }
+        let now = Date()
+        guard now >= start, now < deadline, let hr, hr > 0 else { return }
+        guard smartAlarmWatcher.shouldWake(bpm: hr) else { return }
+        smartAlarmAdvancedTonight = true
+        ble.armStrapAlarm(at: now)
+        Self.postSmartAlarm()
+        let time = DateFormatter.localizedString(from: now, dateStyle: .none, timeStyle: .short)
+        live.append(log: "Smart alarm: advanced to \(time) on a lighter sleep phase")
     }
 
     /// Compute the next fire date for the smart alarm, honouring the weekday selection.
